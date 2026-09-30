@@ -1,0 +1,66 @@
+// Grafana Alloy — ships container logs (stdout/stderr) from the Docker host to Loki.
+// Only containers of this compose project are collected.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=" + sys.env("COMPOSE_PROJECT_NAME")]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.pipeline.receiver]
+}
+
+loki.process "pipeline" {
+  // APISIX JSON access log: promote only low-cardinality fields to labels.
+  // Everything else stays queryable with `| json` in LogQL.
+  stage.match {
+    selector = "{service=\"apisix\", stream=\"stdout\"}"
+
+    stage.json {
+      expressions = { status = "status", method = "method" }
+    }
+    stage.template {
+      source   = "status_class"
+      template = "{{ if .status }}{{ substr 0 1 .status }}xx{{ end }}"
+    }
+    stage.labels {
+      values = { status_class = "", method = "" }
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

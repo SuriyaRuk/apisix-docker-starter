@@ -1,0 +1,6 @@
+.env
+backups/*
+!backups/.gitkeep
+certs/
+.claude/
+.DS_Store

@@ -1,0 +1,351 @@
+# =============================================================================
+# Apache APISIX — Production Docker Compose stack
+#
+#   Core (always on) : etcd x3 (Raft cluster) -> etcd-init (auth bootstrap) -> APISIX
+#   Profile "observability": Prometheus, Alertmanager, Grafana, Loki, Alloy, node-exporter
+#   Profile "demo"          : demo upstream (nginx) used by scripts/smoke-test.sh
+#   Profile "restore"       : one-shot etcd snapshot restore helper
+#
+# All image tags are pinned; override them in .env when upgrading.
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-apisix}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-hardening: &hardening
+  restart: unless-stopped
+  logging: *default-logging
+  security_opt:
+    - no-new-privileges:true
+
+x-etcd-env: &etcd-env
+  TZ: ${TZ:-Asia/Bangkok}
+  ETCD_DATA_DIR: /etcd-data
+  ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+  ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+  ETCD_LISTEN_METRICS_URLS: http://0.0.0.0:2381
+  ETCD_INITIAL_CLUSTER: etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+  ETCD_INITIAL_CLUSTER_STATE: new
+  ETCD_INITIAL_CLUSTER_TOKEN: ${ETCD_CLUSTER_TOKEN:-apisix-etcd-cluster}
+  ETCD_AUTO_COMPACTION_MODE: periodic
+  ETCD_AUTO_COMPACTION_RETENTION: 1h
+  ETCD_QUOTA_BACKEND_BYTES: "4294967296" # 4 GiB
+  ETCD_LOG_LEVEL: warn
+
+x-etcd: &etcd
+  <<: *hardening
+  image: ${ETCD_IMAGE:-quay.io/coreos/etcd:v3.7.2}
+  networks: [etcd, observability]
+  healthcheck:
+    # Logs in as "healthcheck" — a user with NO roles (created by etcd-init).
+    # Its read gets "permission denied", which etcdctl counts as healthy, so the
+    # check still proves the member is serving requests with a leader (quorum).
+    test: ["CMD", "etcdctl", "--user=healthcheck:${ETCD_HEALTHCHECK_PASSWORD:-healthcheck}", "endpoint", "health", "--command-timeout=3s"]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 20s
+  deploy:
+    resources:
+      limits: { cpus: "1.0", memory: 1g }
+
+services:
+  # ---------------------------------------------------------------------------
+  # etcd cluster — configuration store for APISIX (routes, upstreams, SSL, ...)
+  # ---------------------------------------------------------------------------
+  etcd-1:
+    <<: *etcd
+    hostname: etcd-1
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd-1
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-1:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-1:2380
+    volumes:
+      - etcd-1-data:/etcd-data
+      - ./backups:/backups
+
+  etcd-2:
+    <<: *etcd
+    hostname: etcd-2
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd-2
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-2:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-2:2380
+    volumes:
+      - etcd-2-data:/etcd-data
+
+  etcd-3:
+    <<: *etcd
+    hostname: etcd-3
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd-3
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-3:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-3:2380
+    volumes:
+      - etcd-3-data:/etcd-data
+
+  # ---------------------------------------------------------------------------
+  # etcd-init — one-shot job: creates root + least-privilege "apisix" user,
+  # grants readwrite on /apisix prefix only, then enables etcd auth. Idempotent.
+  # ---------------------------------------------------------------------------
+  etcd-init:
+    image: ${COMPOSE_PROJECT_NAME:-apisix}-etcd-tools:${ETCD_TOOLS_TAG:-v3.7.2}
+    build:
+      context: ./etcd
+      args:
+        ETCD_IMAGE: ${ETCD_IMAGE:-quay.io/coreos/etcd:v3.7.2}
+        ALPINE_IMAGE: ${ALPINE_IMAGE:-alpine:3.24.2}
+    restart: "no"
+    logging: *default-logging
+    networks: [etcd]
+    environment:
+      ETCDCTL_ENDPOINTS: http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379
+      ETCD_ROOT_PASSWORD: ${ETCD_ROOT_PASSWORD:?set ETCD_ROOT_PASSWORD in .env}
+      ETCD_APISIX_USER: ${ETCD_APISIX_USER:-apisix}
+      ETCD_APISIX_PASSWORD: ${ETCD_APISIX_PASSWORD:?set ETCD_APISIX_PASSWORD in .env}
+      ETCD_APISIX_PREFIX: /apisix
+      ETCD_HEALTHCHECK_PASSWORD: ${ETCD_HEALTHCHECK_PASSWORD:-healthcheck}
+    command: ["/scripts/init-auth.sh"]
+    depends_on:
+      etcd-1: { condition: service_healthy }
+      etcd-2: { condition: service_healthy }
+      etcd-3: { condition: service_healthy }
+
+  # ---------------------------------------------------------------------------
+  # APISIX — the API gateway (data plane + Admin API + embedded Dashboard UI)
+  # ---------------------------------------------------------------------------
+  apisix:
+    <<: *hardening
+    image: ${APISIX_IMAGE:-apache/apisix:3.19.0-debian}
+    hostname: apisix
+    # nginx: SIGQUIT = graceful shutdown (finish in-flight requests), SIGTERM = fast.
+    stop_signal: SIGQUIT
+    stop_grace_period: 40s
+    depends_on:
+      etcd-init: { condition: service_completed_successfully }
+    environment:
+      TZ: ${TZ:-Asia/Bangkok}
+      APISIX_ADMIN_KEY: ${APISIX_ADMIN_KEY:?set APISIX_ADMIN_KEY in .env}
+      APISIX_VIEWER_KEY: ${APISIX_VIEWER_KEY:?set APISIX_VIEWER_KEY in .env}
+      APISIX_ENCRYPTION_KEY: ${APISIX_ENCRYPTION_KEY:?set APISIX_ENCRYPTION_KEY (32 chars) in .env}
+      # Gateway IPs of the non-internal networks = where host-published traffic
+      # to the Admin port arrives from. Must match the *_SUBNET values below.
+      ADMIN_ALLOW_GW_EDGE: ${ADMIN_ALLOW_GW_EDGE:-172.30.0.1/32}
+      ADMIN_ALLOW_GW_OBS: ${ADMIN_ALLOW_GW_OBS:-172.30.1.1/32}
+      ADMIN_ALLOW_GW_UPSTREAM: ${ADMIN_ALLOW_GW_UPSTREAM:-172.30.2.1/32}
+      ETCD_APISIX_USER: ${ETCD_APISIX_USER:-apisix}
+      ETCD_APISIX_PASSWORD: ${ETCD_APISIX_PASSWORD:?set ETCD_APISIX_PASSWORD in .env}
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+    ports:
+      - "${APISIX_HTTP_BIND:-0.0.0.0}:${APISIX_HTTP_PORT:-80}:9080"
+      - "${APISIX_HTTPS_BIND:-0.0.0.0}:${APISIX_HTTPS_PORT:-443}:9443"
+      # Admin API + Dashboard UI: loopback only. Reach it via SSH tunnel / VPN.
+      - "${APISIX_ADMIN_BIND:-127.0.0.1}:${APISIX_ADMIN_PORT:-9180}:9180"
+    networks:
+      edge:
+        gw_priority: 100
+      etcd: {}
+      observability: {}
+      upstream: {}
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.ip_local_port_range: "1024 65000"
+    healthcheck:
+      # Image has no curl/wget: use bash /dev/tcp against the status API.
+      # /status/ready = 200 only when every worker has synced config from etcd.
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/7085 && printf "GET /status/ready HTTP/1.0\r\n\r\n" >&3 && head -n1 <&3 | grep -q " 200"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "${APISIX_CPUS:-2.0}", memory: "${APISIX_MEMORY:-2g}" }
+
+  # ---------------------------------------------------------------------------
+  # Observability (profile: observability)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    <<: *hardening
+    profiles: [observability]
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-30d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-20GB}
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${OBS_BIND:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    networks: [observability]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 2g }
+
+  alertmanager:
+    <<: *hardening
+    profiles: [observability]
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "${OBS_BIND:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
+    networks: [observability]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+
+  grafana:
+    <<: *hardening
+    profiles: [observability]
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.2.3}
+    environment:
+      TZ: ${TZ:-Asia/Bangkok}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_COOKIE_SECURE: ${GRAFANA_COOKIE_SECURE:-false}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${OBS_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    networks: [observability]
+    depends_on: [prometheus, loki]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1g }
+
+  loki:
+    <<: *hardening
+    profiles: [observability]
+    image: ${LOKI_IMAGE:-grafana/loki:3.7.8}
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    networks: [observability]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1g }
+
+  alloy:
+    <<: *hardening
+    profiles: [observability]
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.20.1}
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-apisix}
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    networks: [observability]
+    depends_on: [loki]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512m }
+
+  node-exporter:
+    <<: *hardening
+    profiles: [observability]
+    image: ${NODE_EXPORTER_IMAGE:-prom/node-exporter:v1.12.1}
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+)($|/)
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    networks: [observability]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128m }
+
+  # ---------------------------------------------------------------------------
+  # Demo upstream (profile: demo) — only for smoke tests, not needed in prod
+  # ---------------------------------------------------------------------------
+  demo-upstream:
+    <<: *hardening
+    profiles: [demo]
+    image: ${DEMO_IMAGE:-nginx:1.31.6-alpine}
+    networks: [upstream]
+
+  # ---------------------------------------------------------------------------
+  # etcd restore helper (profile: restore) — see scripts/etcd-restore.sh
+  # ---------------------------------------------------------------------------
+  etcd-restore:
+    image: ${COMPOSE_PROJECT_NAME:-apisix}-etcd-tools:${ETCD_TOOLS_TAG:-v3.7.2}
+    profiles: [restore]
+    pull_policy: never # built by etcd-init
+    restart: "no"
+    user: "0:0" # etcd data volumes are root-owned
+    network_mode: none
+    environment:
+      ETCD_CLUSTER_TOKEN: ${ETCD_CLUSTER_TOKEN:-apisix-etcd-cluster}
+    volumes:
+      - etcd-1-data:/data/etcd-1
+      - etcd-2-data:/data/etcd-2
+      - etcd-3-data:/data/etcd-3
+      - ./backups:/backups:ro
+
+networks:
+  # Public-facing network (APISIX published ports).
+  edge:
+    ipam:
+      config:
+        - subnet: ${EDGE_SUBNET:-172.30.0.0/24}
+  # etcd lives here only; internal = no route to/from outside the host.
+  etcd:
+    internal: true
+  # Prometheus/Grafana/Loki scrape & push traffic.
+  observability:
+    ipam:
+      config:
+        - subnet: ${OBSERVABILITY_SUBNET:-172.30.1.0/24}
+  # Put your backend services on this network (or use external upstreams).
+  upstream:
+    ipam:
+      config:
+        - subnet: ${UPSTREAM_SUBNET:-172.30.2.0/24}
+
+volumes:
+  etcd-1-data:
+  etcd-2-data:
+  etcd-3-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  loki-data:
+  alloy-data:
